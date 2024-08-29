@@ -5,6 +5,10 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "sleeplock.h"
+#include "fs.h"
+#include "file.h"
+#include "fcntl.h"
 
 struct spinlock tickslock;
 uint ticks;
@@ -65,9 +69,67 @@ usertrap(void)
     intr_on();
 
     syscall();
+  } 
+  // 对访问文件映射内存产生的page fault进行处理
+  else if (r_scause() == 12 || r_scause() == 13
+             || r_scause() == 15) {
+    char *pa;
+    uint64 va = PGROUNDDOWN(r_stval());
+    struct vm_area *vma = 0;
+    int flags = PTE_U;
+    int i;
+    // 根据发生page fault的地址去当前进程的VMA数组中找对应的VMA结构体
+    for (i = 0; i < NVMA; ++i) {
+      // 超过文件实际大小的部分, 内容都会是 0, 可以访问修改, 但最后都不会写回文件中.
+      if (p->vma[i].addr && va >= p->vma[i].addr
+          && va < p->vma[i].addr + p->vma[i].len) {
+        vma = &p->vma[i];
+        break;
+      }
+    }
+    if (!vma) {
+      goto err;
+    }
+    // 找到对应的VMA则表明本次page fault是由于访问文件映射的内存产生的，继续执行后续操作
+    if (r_scause() == 15 && (vma->prot & PROT_WRITE)
+        && walkaddr(p->pagetable, va)) {
+      if (uvmsetdirtywrite(p->pagetable, va)) {
+        goto err;
+      }
+    } else {
+      // Lazy allocation, 使用kalloc先分配一个物理页, 并使用memset进行清空
+      if ((pa = kalloc()) == 0) {
+        goto err;
+      }
+      memset(pa, 0, PGSIZE);
+      ilock(vma->f->ip);
+      // 使用readi()根据发生page fault的地址从文件的相应部分读取内容到分配的物理页
+      if (readi(vma->f->ip, 0, (uint64) pa, va - vma->addr + vma->offset, PGSIZE) < 0) {
+        iunlock(vma->f->ip);
+        goto err;
+      }
+      // 设置访问权限
+      iunlock(vma->f->ip);
+      if ((vma->prot & PROT_READ)) {
+        flags |= PTE_R;
+      }
+      // 对于写权限此处只有本次是 Store Page fault 时才会设置
+      if (r_scause() == 15 && (vma->prot & PROT_WRITE)) {
+        flags |= PTE_W | PTE_D;
+      }
+      if ((vma->prot & PROT_EXEC)) {
+        flags |= PTE_X;
+      }
+      // 使用mappages()将物理页映射到用户进程的页面值
+      if (mappages(p->pagetable, va, PGSIZE, (uint64) pa, flags) != 0) {
+        kfree(pa);
+        goto err;
+      }
+    }
   } else if((which_dev = devintr()) != 0){
     // ok
   } else {
+err:
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
     p->killed = 1;
