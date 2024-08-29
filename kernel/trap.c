@@ -16,6 +16,52 @@ void kernelvec();
 
 extern int devintr();
 
+// 模仿vm.c中的walkaddr函数，增加对COW的处理部分
+uint64 walkcowaddr(pagetable_t pagetable, uint64 va) {
+  pte_t *pte;
+  uint64 pa;
+  char* mem;
+  uint flags;
+
+  if (va >= MAXVA)
+    return 0;
+
+  pte = walk(pagetable, va, 0);
+  if (pte == 0)
+      return 0;
+  if ((*pte & PTE_V) == 0)
+      return 0;
+  if ((*pte & PTE_U) == 0)
+    return 0;
+  pa = PTE2PA(*pte);
+  // 判断写标志位是否不存在
+  if ((*pte & PTE_W) == 0) {
+    // 没有COW标志的PTE不能申请页表
+    if ((*pte & PTE_COW) == 0) {
+        return 0;
+    }
+    // 分配新物理页
+    if ((mem = kalloc()) == 0) {
+      return 0;
+    }
+    // 拷贝页表内容
+    memmove(mem, (void*)pa, PGSIZE);
+    // 更新标志位
+    flags = (PTE_FLAGS(*pte) & (~PTE_COW)) | PTE_W;
+    // 取消原映射
+    uvmunmap(pagetable, PGROUNDDOWN(va), 1, 1);
+    // 更新新映射
+    if (mappages(pagetable, PGROUNDDOWN(va), PGSIZE, (uint64)mem, flags) != 0) {
+      kfree(mem);
+      return 0;
+    }
+    // COW情况下返回新物理地址
+    return (uint64)mem;
+  }
+  return pa;
+}
+
+
 void
 trapinit(void)
 {
@@ -65,9 +111,15 @@ usertrap(void)
     intr_on();
 
     syscall();
+  } else if(r_scause()==15) {
+    // 考虑 r_scause()==15 的条件, 因为只有在 store 指令写操作时触发 page fault 才考虑 COW 机制
+    if (walkcowaddr(p->pagetable, r_stval()) == 0) {
+      goto bad;
+    }
   } else if((which_dev = devintr()) != 0){
     // ok
   } else {
+bad:
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
     p->killed = 1;
