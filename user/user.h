@@ -40,3 +40,7 @@ void free(void*);
 int atoi(const char*);
 int memcmp(const void *, const void *, uint);
 void *memcpy(void *, const void *, uint);
+
+// 给lab4-3 Alarm添加函数声明
+int sigalarm(int ticks, void (*handler)());
+int sigreturn(void);
