@@ -5,7 +5,8 @@
 #include <pthread.h>
 #include <sys/time.h>
 
-#define NBUCKET 5
+// 修改 NBUCKET 避免并发写入内存重叠
+#define NBUCKET 7
 #define NKEYS 100000
 
 struct entry {
@@ -16,6 +17,8 @@ struct entry {
 struct entry *table[NBUCKET];
 int keys[NKEYS];
 int nthread = 1;
+// 定义一组互斥锁
+pthread_mutex_t locks[NBUCKET];
 
 double
 now()
@@ -50,8 +53,12 @@ void put(int key, int value)
     // update the existing key.
     e->value = value;
   } else {
+    // 加锁
+    pthread_mutex_lock(&locks[i]);
     // the new is new.
     insert(key, value, &table[i], table[i]);
+    // 解锁
+    pthread_mutex_unlock(&locks[i]);
   }
 }
 
@@ -113,6 +120,11 @@ main(int argc, char *argv[])
   assert(NKEYS % nthread == 0);
   for (int i = 0; i < NKEYS; i++) {
     keys[i] = random();
+  }
+
+  // 初始化互斥锁数组
+  for(int i = 0; i < NBUCKET; ++i) {
+      pthread_mutex_init(&locks[i], NULL);
   }
 
   //

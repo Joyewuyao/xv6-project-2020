@@ -22,6 +22,7 @@ barrier_init(void)
   bstate.nthread = 0;
 }
 
+// 保证进程同步的时候使用
 static void 
 barrier()
 {
@@ -30,7 +31,19 @@ barrier()
   // Block until all threads have called barrier() and
   // then increment bstate.round.
   //
-  
+  // 上锁
+  pthread_mutex_lock(&bstate.barrier_mutex);
+  // 判断是否所有的线程都到了这个地方
+  if(++bstate.nthread != nthread)  {    // not all threads reach    
+    pthread_cond_wait(&bstate.barrier_cond,&bstate.barrier_mutex);  // wait other threads
+  } else {  // 所有线程都到了
+    bstate.nthread = 0;
+    ++bstate.round;
+    // 唤醒所有sleep的线程
+    pthread_cond_broadcast(&bstate.barrier_cond);
+  }
+  // 解锁
+  pthread_mutex_unlock(&bstate.barrier_mutex);
 }
 
 static void *
