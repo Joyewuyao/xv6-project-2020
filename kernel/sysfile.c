@@ -283,6 +283,45 @@ create(char *path, short type, short major, short minor)
   return ip;
 }
 
+// 用来寻找符号链接的目标文件
+static struct inode* follow_symlink(struct inode* ip) {
+  uint inums[NSYMLINK];
+  int i, j;
+  char target[MAXPATH];
+
+  for(i = 0; i < NSYMLINK; ++i) {
+    inums[i] = ip->inum;
+    // 读到符号链接的目标
+    if(readi(ip, 0, (uint64)target, 0, MAXPATH) <= 0) {
+      iunlockput(ip);
+      printf("open_symlink: open symlink failed\n");
+      return 0;
+    }
+    iunlockput(ip);
+    
+    // 链接深度限制
+    if((ip = namei(target)) == 0) {
+      printf("open_symlink: path \"%s\" is not exist\n", target);
+      return 0;
+    }
+    // 成环检测
+    for(j = 0; j <= i; ++j) {
+      if(ip->inum == inums[j]) {
+        printf("open_symlink: links form a cycle\n");
+        return 0;
+      }
+    }
+    ilock(ip);
+    if(ip->type != T_SYMLINK) {
+      return ip;
+    }
+  }
+
+  iunlockput(ip);
+  printf("open_symlink: the depth of links reaches the limit\n");
+  return 0;
+}
+
 uint64
 sys_open(void)
 {
@@ -320,6 +359,15 @@ sys_open(void)
     iunlockput(ip);
     end_op();
     return -1;
+  }
+
+  // 对符号链接文件进行额外处理
+  if(ip->type == T_SYMLINK && (omode & O_NOFOLLOW) == 0) {
+    if((ip = follow_symlink(ip)) == 0) {
+      // 此处不用调用iunlockput()释放锁,因为在follow_symlinktest()返回失败时ip的锁在函数内已经被释放
+      end_op();
+      return -1;
+    }
   }
 
   if((f = filealloc()) == 0 || (fd = fdalloc(f)) < 0){
@@ -482,5 +530,34 @@ sys_pipe(void)
     fileclose(wf);
     return -1;
   }
+  return 0;
+}
+
+// 用来生成符号链接，存储目标文件的路径
+uint64 sys_symlink(void) {
+  char target[MAXPATH], path[MAXPATH];
+  struct inode *ip;
+  int n;
+
+  if ((n = argstr(0, target, MAXPATH)) < 0
+    || argstr(1, path, MAXPATH) < 0) {
+    return -1;
+  }
+
+  begin_op();
+  // 创建符号链接路径对应的inode结构
+  if((ip = create(path, T_SYMLINK, 0, 0)) == 0) {
+    end_op();
+    return -1;
+  }
+  // 将链接的目标文件的路径写入inode中
+  if(writei(ip, 0, (uint64)target, 0, n) != n) {
+    iunlockput(ip);
+    end_op();
+    return -1;
+  }
+
+  iunlockput(ip);
+  end_op();
   return 0;
 }
