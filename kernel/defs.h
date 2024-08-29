@@ -157,7 +157,19 @@ void            uartputc(int);
 void            uartputc_sync(int);
 int             uartgetc(void);
 
+// vmcopyin.c
+int             copyin_new(pagetable_t, char *, uint64, uint64);
+int             copyinstr_new(pagetable_t, char *, uint64, uint64);
+
 // vm.c
+void            u2kvmcopy(pagetable_t pagetable, pagetable_t kernelpt, uint64 oldsz, uint64 newsz);
+pte_t           *walk(pagetable_t pagetable, uint64 va, int alloc);
+// 声明辅助函数
+void            uvmmap(pagetable_t pagetable, uint64 va, uint64 pa, uint64 sz, int perm);
+// 用于内核页表的初始化
+pagetable_t     proc_kpt_init(void);
+// 将进程的内核页表保存到SATP寄存器
+void            proc_inithart(pagetable_t); 
 void            kvminit(void);
 void            kvminithart(void);
 uint64          kvmpa(uint64);
@@ -193,7 +205,10 @@ void            virtio_disk_intr(void);
 // number of elements in fixed-size array
 #define NELEM(x) (sizeof(x)/sizeof((x)[0]))
 
-
+// 打印页表信息的
+// int             copyin(pagetable_t, char *, uint64, uint64);
+// int             copyinstr(pagetable_t, char *, uint64, uint64);
+void            vmprint(pagetable_t);
 
 // stats.c
 void            statsinit(void);
