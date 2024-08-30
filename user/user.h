@@ -1,5 +1,4 @@
 struct stat;
-struct rtcdate;
 
 // system calls
 int fork(void);
@@ -10,7 +9,7 @@ int write(int, const void*, int);
 int read(int, void*, int);
 int close(int);
 int kill(int);
-int exec(char*, char**);
+int exec(const char*, char**);
 int open(const char*, int);
 int mknod(const char*, short, short);
 int unlink(const char*);
@@ -23,8 +22,8 @@ int getpid(void);
 char* sbrk(int);
 int sleep(int);
 int uptime(void);
-void *mmap(void *addr, int length, int prot, int flags, int fd, int offset);
-int munmap(void *add, int length);
+void *mmap(void*,int,int,int,int,int);
+int munmap(void*,int);
 
 // ulib.c
 int stat(const char*, struct stat*);
