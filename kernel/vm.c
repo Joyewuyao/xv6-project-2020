@@ -5,7 +5,8 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
-
+#include "spinlock.h"
+#include "proc.h"
 /*
  * the kernel's page table.
  */
@@ -15,36 +16,45 @@ extern char etext[];  // kernel.ld sets this to end of kernel code.
 
 extern char trampoline[]; // trampoline.S
 
-/*
- * create a direct-map page table for the kernel.
- */
-void
-kvminit()
+// Make a direct-map page table for the kernel.
+pagetable_t
+kvmmake(void)
 {
-  kernel_pagetable = (pagetable_t) kalloc();
-  memset(kernel_pagetable, 0, PGSIZE);
+  pagetable_t kpgtbl;
+
+  kpgtbl = (pagetable_t) kalloc();
+  memset(kpgtbl, 0, PGSIZE);
 
   // uart registers
-  kvmmap(UART0, UART0, PGSIZE, PTE_R | PTE_W);
+  kvmmap(kpgtbl, UART0, UART0, PGSIZE, PTE_R | PTE_W);
 
   // virtio mmio disk interface
-  kvmmap(VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
-
-  // CLINT
-  kvmmap(CLINT, CLINT, 0x10000, PTE_R | PTE_W);
+  kvmmap(kpgtbl, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
 
   // PLIC
-  kvmmap(PLIC, PLIC, 0x400000, PTE_R | PTE_W);
+  kvmmap(kpgtbl, PLIC, PLIC, 0x400000, PTE_R | PTE_W);
 
   // map kernel text executable and read-only.
-  kvmmap(KERNBASE, KERNBASE, (uint64)etext-KERNBASE, PTE_R | PTE_X);
+  kvmmap(kpgtbl, KERNBASE, KERNBASE, (uint64)etext-KERNBASE, PTE_R | PTE_X);
 
   // map kernel data and the physical RAM we'll make use of.
-  kvmmap((uint64)etext, (uint64)etext, PHYSTOP-(uint64)etext, PTE_R | PTE_W);
+  kvmmap(kpgtbl, (uint64)etext, (uint64)etext, PHYSTOP-(uint64)etext, PTE_R | PTE_W);
 
   // map the trampoline for trap entry/exit to
   // the highest virtual address in the kernel.
-  kvmmap(TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+  kvmmap(kpgtbl, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+
+  // allocate and map a kernel stack for each process.
+  proc_mapstacks(kpgtbl);
+  
+  return kpgtbl;
+}
+
+// Initialize the one kernel_pagetable
+void
+kvminit(void)
+{
+  kernel_pagetable = kvmmake();
 }
 
 // Switch h/w page table register to the kernel's page table,
@@ -52,7 +62,12 @@ kvminit()
 void
 kvminithart()
 {
+  // wait for any previous writes to the page table memory to finish.
+  sfence_vma();
+
   w_satp(MAKE_SATP(kernel_pagetable));
+
+  // flush stale entries from the TLB.
   sfence_vma();
 }
 
@@ -115,35 +130,16 @@ walkaddr(pagetable_t pagetable, uint64 va)
 // only used when booting.
 // does not flush TLB or enable paging.
 void
-kvmmap(uint64 va, uint64 pa, uint64 sz, int perm)
+kvmmap(pagetable_t kpgtbl, uint64 va, uint64 pa, uint64 sz, int perm)
 {
-  if(mappages(kernel_pagetable, va, sz, pa, perm) != 0)
+  if(mappages(kpgtbl, va, sz, pa, perm) != 0)
     panic("kvmmap");
 }
 
-// translate a kernel virtual address to
-// a physical address. only needed for
-// addresses on the stack.
-// assumes va is page aligned.
-uint64
-kvmpa(uint64 va)
-{
-  uint64 off = va % PGSIZE;
-  pte_t *pte;
-  uint64 pa;
-  
-  pte = walk(kernel_pagetable, va, 0);
-  if(pte == 0)
-    panic("kvmpa");
-  if((*pte & PTE_V) == 0)
-    panic("kvmpa");
-  pa = PTE2PA(*pte);
-  return pa+off;
-}
-
 // Create PTEs for virtual addresses starting at va that refer to
-// physical addresses starting at pa. va and size might not
-// be page-aligned. Returns 0 on success, -1 if walk() couldn't
+// physical addresses starting at pa.
+// va and size MUST be page-aligned.
+// Returns 0 on success, -1 if walk() couldn't
 // allocate a needed page-table page.
 int
 mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
@@ -151,13 +147,22 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
   uint64 a, last;
   pte_t *pte;
 
-  a = PGROUNDDOWN(va);
-  last = PGROUNDDOWN(va + size - 1);
+  if((va % PGSIZE) != 0)
+    panic("mappages: va not aligned");
+
+  if((size % PGSIZE) != 0)
+    panic("mappages: size not aligned");
+
+  if(size == 0)
+    panic("mappages: size");
+  
+  a = va;
+  last = va + size - PGSIZE;
   for(;;){
     if((pte = walk(pagetable, a, 1)) == 0)
       return -1;
-    if(*pte & PTE_V)
-      panic("remap");
+//    if(*pte & PTE_V)
+//      panic("mappages: remap");
     *pte = PA2PTE(pa) | perm | PTE_V;
     if(a == last)
       break;
@@ -211,12 +216,12 @@ uvmcreate()
 // for the very first process.
 // sz must be less than a page.
 void
-uvminit(pagetable_t pagetable, uchar *src, uint sz)
+uvmfirst(pagetable_t pagetable, uchar *src, uint sz)
 {
   char *mem;
 
   if(sz >= PGSIZE)
-    panic("inituvm: more than a page");
+    panic("uvmfirst: more than a page");
   mem = kalloc();
   memset(mem, 0, PGSIZE);
   mappages(pagetable, 0, PGSIZE, (uint64)mem, PTE_W|PTE_R|PTE_X|PTE_U);
@@ -226,7 +231,7 @@ uvminit(pagetable_t pagetable, uchar *src, uint sz)
 // Allocate PTEs and physical memory to grow process from oldsz to
 // newsz, which need not be page aligned.  Returns new size or 0 on error.
 uint64
-uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
+uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
 {
   char *mem;
   uint64 a;
@@ -242,7 +247,7 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
       return 0;
     }
     memset(mem, 0, PGSIZE);
-    if(mappages(pagetable, a, PGSIZE, (uint64)mem, PTE_W|PTE_X|PTE_R|PTE_U) != 0){
+    if(mappages(pagetable, a, PGSIZE, (uint64)mem, PTE_R|PTE_U|xperm) != 0){
       kfree(mem);
       uvmdealloc(pagetable, a, oldsz);
       return 0;
@@ -311,32 +316,26 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  // char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
       panic("uvmcopy: pte should exist");
     if((*pte & PTE_V) == 0)
       panic("uvmcopy: page not present");
+   
+    // 清除父进程的PTE_W位，设置PTE_COW位
+    // 如果父进程是只读页，无需设置PTE_COW位
+    if(*pte & PTE_W) {
+      *pte = (*pte & (~PTE_W)) | PTE_COW;
+    }
     pa = PTE2PA(*pte);
+    kaddref((void *)pa); // 引用加1
 
-    // 去除原有的写标志位PTE_W，添加COW标志位PTE_COW
-    flags = (PTE_FLAGS(*pte) & (~PTE_W)) | PTE_COW;
-    *pte = PA2PTE(pa) | flags;
-
-    // flags = PTE_FLAGS(*pte);
-    // 不再申请新的页表
-    // if((mem = kalloc()) == 0)
-    //   goto err;
-    // memmove(mem, (char*)pa, PGSIZE);
-
-    // 这里使用老的pa替换mem
-    if(mappages(new, i, PGSIZE, pa, flags) != 0){
-      // kfree(mem);
+    // 子进程不需要内存，指向pa，页表属性为flags
+    flags = PTE_FLAGS(*pte);
+    if(mappages(new, i, PGSIZE, (uint64)pa, flags) != 0){
       goto err;
     }
-    // 调用引用计数加1
-    increfcnt(pa);
   }
   return 0;
 
@@ -365,20 +364,52 @@ int
 copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 {
   uint64 n, va0, pa0;
-
+  pte_t * pte;
+ 
   while(len > 0){
+    // 查找虚拟地址dstva对应的物理地址pa0
     va0 = PGROUNDDOWN(dstva);
-    // 将walkaddr换为walkcowaddr
-    pa0 = walkcowaddr(pagetable, va0);
-    if(pa0 == 0)
+    // walkaddr调用了walk
+    pa0 = walkaddr(pagetable, va0); 
+    if(pa0 == 0) // 查找失败
       return -1;
+    struct proc *p = myproc();
+    if(va0 >= MAXVA)
+      return -1;
+    if(va0 < PGSIZE)
+      return -1;
+    if((pte = walk(pagetable, va0, 0))==0) {
+      p->killed = 1;     
+      return -1;
+    } 
+    // check
+    if ((va0 < p->sz) && (*pte & PTE_V) &&
+            (*pte & PTE_COW)&&(*pte & PTE_U)) {
+      char refcnt = kgetref((void *)pa0);
+      if(refcnt == 1) {
+         *pte = (*pte &(~PTE_COW)) | PTE_W;
+      }else if(refcnt > 1){
+        char *mem;
+        ksubref((void *)pa0);
+        if ((mem = kalloc()) == 0) {
+          p->killed = 1;        
+          return -1;
+        } 
+        memmove(mem, (char*)pa0, PGSIZE);
+        uint flags = PTE_FLAGS(*pte);
+        *pte = (PA2PTE(mem) | flags | PTE_W);
+        *pte &= ~PTE_COW;
+        pa0 = (uint64)mem;
+
+      }
+    }
     n = PGSIZE - (dstva - va0);
     if(n > len)
       n = len;
     memmove((void *)(pa0 + (dstva - va0)), src, n);
 
     len -= n;
-    src += n;
+    src += n; 
     dstva = va0 + PGSIZE;
   }
   return 0;

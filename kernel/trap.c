@@ -16,52 +16,6 @@ void kernelvec();
 
 extern int devintr();
 
-// 模仿vm.c中的walkaddr函数，增加对COW的处理部分
-uint64 walkcowaddr(pagetable_t pagetable, uint64 va) {
-  pte_t *pte;
-  uint64 pa;
-  char* mem;
-  uint flags;
-
-  if (va >= MAXVA)
-    return 0;
-
-  pte = walk(pagetable, va, 0);
-  if (pte == 0)
-      return 0;
-  if ((*pte & PTE_V) == 0)
-      return 0;
-  if ((*pte & PTE_U) == 0)
-    return 0;
-  pa = PTE2PA(*pte);
-  // 判断写标志位是否不存在
-  if ((*pte & PTE_W) == 0) {
-    // 没有COW标志的PTE不能申请页表
-    if ((*pte & PTE_COW) == 0) {
-        return 0;
-    }
-    // 分配新物理页
-    if ((mem = kalloc()) == 0) {
-      return 0;
-    }
-    // 拷贝页表内容
-    memmove(mem, (void*)pa, PGSIZE);
-    // 更新标志位
-    flags = (PTE_FLAGS(*pte) & (~PTE_COW)) | PTE_W;
-    // 取消原映射
-    uvmunmap(pagetable, PGROUNDDOWN(va), 1, 1);
-    // 更新新映射
-    if (mappages(pagetable, PGROUNDDOWN(va), PGSIZE, (uint64)mem, flags) != 0) {
-      kfree(mem);
-      return 0;
-    }
-    // COW情况下返回新物理地址
-    return (uint64)mem;
-  }
-  return pa;
-}
-
-
 void
 trapinit(void)
 {
@@ -99,33 +53,36 @@ usertrap(void)
   if(r_scause() == 8){
     // system call
 
-    if(p->killed)
+    if(killed(p))
       exit(-1);
 
     // sepc points to the ecall instruction,
     // but we want to return to the next instruction.
     p->trapframe->epc += 4;
 
-    // an interrupt will change sstatus &c registers,
-    // so don't enable until done with those registers.
+    // an interrupt will change sepc, scause, and sstatus,
+    // so enable only now that we're done with those registers.
     intr_on();
 
     syscall();
-  } else if(r_scause()==15) {
-    // 考虑 r_scause()==15 的条件, 因为只有在 store 指令写操作时触发 page fault 才考虑 COW 机制
-    if (walkcowaddr(p->pagetable, r_stval()) == 0) {
-      goto bad;
+  } else if(r_scause() == 15) { // 写页面错
+    uint64 va0 = r_stval();
+    if(va0 > p->sz) {
+      p->killed = 1;    
+    } else if(cowhandler(p->pagetable,va0) !=0 ) {
+      p->killed = 1;
+    } else if(va0 < PGSIZE) {
+      p->killed = 1;
     }
   } else if((which_dev = devintr()) != 0){
     // ok
   } else {
-bad:
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
-    p->killed = 1;
+    setkilled(p);
   }
 
-  if(p->killed)
+  if(killed(p))
     exit(-1);
 
   // give up the CPU if this is a timer interrupt.
@@ -148,11 +105,12 @@ usertrapret(void)
   // we're back in user space, where usertrap() is correct.
   intr_off();
 
-  // send syscalls, interrupts, and exceptions to trampoline.S
-  w_stvec(TRAMPOLINE + (uservec - trampoline));
+  // send syscalls, interrupts, and exceptions to uservec in trampoline.S
+  uint64 trampoline_uservec = TRAMPOLINE + (uservec - trampoline);
+  w_stvec(trampoline_uservec);
 
   // set up trapframe values that uservec will need when
-  // the process next re-enters the kernel.
+  // the process next traps into the kernel.
   p->trapframe->kernel_satp = r_satp();         // kernel page table
   p->trapframe->kernel_sp = p->kstack + PGSIZE; // process's kernel stack
   p->trapframe->kernel_trap = (uint64)usertrap;
@@ -173,11 +131,11 @@ usertrapret(void)
   // tell trampoline.S the user page table to switch to.
   uint64 satp = MAKE_SATP(p->pagetable);
 
-  // jump to trampoline.S at the top of memory, which 
+  // jump to userret in trampoline.S at the top of memory, which 
   // switches to the user page table, restores user registers,
   // and switches to user mode with sret.
-  uint64 fn = TRAMPOLINE + (userret - trampoline);
-  ((void (*)(uint64,uint64))fn)(TRAPFRAME, satp);
+  uint64 trampoline_userret = TRAMPOLINE + (userret - trampoline);
+  ((void (*)(uint64))trampoline_userret)(satp);
 }
 
 // interrupts and exceptions from kernel code go here via kernelvec,
@@ -268,5 +226,39 @@ devintr()
   } else {
     return 0;
   }
+}
+
+int
+cowhandler(pagetable_t pagetable, uint64 va)
+{
+    char *mem;
+    if (va >= MAXVA)
+      return -1;
+    pte_t *pte = walk(pagetable, va, 0);
+    if (pte == 0)
+      return -1;
+    // check the PTE
+    if ((*pte & PTE_COW) == 0 || (*pte & PTE_U) == 0 || (*pte & PTE_V) == 0) {
+      return -1;
+    }
+    uint64 pa = PTE2PA(*pte);
+    char refcnt = kgetref((void *)pa);
+    if(refcnt == 1) {
+       *pte = (*pte & (~PTE_COW)) | PTE_W;
+       return 0;
+    }
+    if(refcnt > 1) {
+      if ((mem = kalloc()) == 0) {
+        return -1;
+      }
+      // copy old data to new mem
+      memmove((char*)mem, (char*)pa, PGSIZE);
+      kfree((void*)pa);
+      uint flags = PTE_FLAGS(*pte);
+      *pte = (PA2PTE(mem) | flags | PTE_W);//设置新申请的页可写
+      *pte &= ~PTE_COW; //清楚新申请页的COW标记
+      return 0;
+    }
+    return -1;
 }
 
